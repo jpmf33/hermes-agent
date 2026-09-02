@@ -72,7 +72,7 @@ class _RecallResult:
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+_MIN_CLIENT_VERSION = "0.9.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
@@ -354,8 +354,10 @@ def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT):
 RETAIN_SCHEMA = {
     "name": "hindsight_retain",
     "description": (
-        "Store information to long-term memory. Hindsight automatically "
-        "extracts structured facts, resolves entities, and indexes for retrieval."
+        "Manually store a durable fact in long-term memory. Use only when the user "
+        "explicitly asks to remember it or has clearly confirmed it as stable and "
+        "useful across future sessions. Do not store task status, guesses, secrets, "
+        "clinical identifiers, or assistant-generated claims."
     ),
     "parameters": {
         "type": "object",
@@ -882,6 +884,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Bank
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
+        self._bank_config_sync_attempted = False
         self._bank_id_template = ""
 
     @property
@@ -1223,6 +1226,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 10.0},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
+            {"key": "recall_min_final_score", "description": "Optional minimum final relevance score; filters weak matches server-side (0 disables)", "default": 0.0},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
@@ -1535,8 +1539,30 @@ class HindsightMemoryProvider(MemoryProvider):
     def _run_hindsight_operation(self, operation):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
         client = self._get_client()
+
+        async def _run(client):
+            if not self._bank_config_sync_attempted and (
+                self._bank_mission or self._bank_retain_mission
+            ):
+                self._bank_config_sync_attempted = True
+                create_bank = getattr(client, "acreate_bank", None)
+                if callable(create_bank):
+                    try:
+                        await create_bank(
+                            bank_id=self._bank_id,
+                            reflect_mission=self._bank_mission or None,
+                            retain_mission=self._bank_retain_mission,
+                        )
+                    except Exception as exc:
+                        logger.warning("Hindsight bank mission sync failed: %s", exc)
+                else:
+                    logger.warning(
+                        "Hindsight client does not support bank mission sync; upgrade hindsight-client"
+                    )
+            return await operation(client)
+
         try:
-            return self._run_sync(operation(client))
+            return self._run_sync(_run(client))
         except Exception as exc:
             if not self._is_retriable_embedded_connection_error(exc):
                 raise
@@ -1547,7 +1573,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = None
             client = self._get_client()
             self._client = client
-            return self._run_sync(operation(client))
+            return self._run_sync(_run(client))
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
@@ -1691,6 +1717,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Bank options
         self._bank_mission = self._config.get("bank_mission", "")
         self._bank_retain_mission = self._config.get("bank_retain_mission") or None
+        self._bank_config_sync_attempted = False
 
         # Tags
         self._retain_tags = _normalize_retain_tags(
@@ -1723,6 +1750,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_recall = self._config.get("auto_recall", True)
         self._recall_sync = bool(self._config.get("recall_sync", False))
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
+        self._recall_min_final_score = max(
+            0.0, float(self._config.get("recall_min_final_score", 0.0))
+        )
         # Default narrows recall to observation-only; pass an explicit
         # `recall_types` list in config.json to broaden (e.g. include
         # "world" / "experience") or to disable the filter entirely.
@@ -1850,14 +1880,16 @@ class HindsightMemoryProvider(MemoryProvider):
                 f"# Hindsight Memory\n"
                 f"Active (tools mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
                 f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-                f"hindsight_retain to store facts."
+                f"and hindsight_retain only when the user explicitly asks to remember "
+                f"or clearly confirms a durable fact."
             )
         return (
             f"# Hindsight Memory\n"
             f"Active. Bank: {self._bank_id}, budget: {self._budget}.\n"
             f"Relevant memories are automatically injected into context. "
             f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-            f"hindsight_retain to store facts."
+            f"and hindsight_retain only when the user explicitly asks to remember "
+            f"or clearly confirms a durable fact."
         )
 
     def _recall_disabled(self) -> bool:
@@ -1900,6 +1932,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 recall_kwargs["tags_match"] = self._recall_tags_match
             if self._recall_types:
                 recall_kwargs["types"] = self._recall_types
+            if self._recall_min_final_score:
+                recall_kwargs["min_scores"] = {"final": self._recall_min_final_score}
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
@@ -2242,6 +2276,8 @@ class HindsightMemoryProvider(MemoryProvider):
                     recall_kwargs["tags_match"] = self._recall_tags_match
                 if self._recall_types:
                     recall_kwargs["types"] = self._recall_types
+                if self._recall_min_final_score:
+                    recall_kwargs["min_scores"] = {"final": self._recall_min_final_score}
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
@@ -2321,8 +2357,15 @@ class HindsightMemoryProvider(MemoryProvider):
         # 1. Flush any buffered turns under the OLD identifiers. Snapshot
         # everything before mutating self._* so metadata + tags + doc_id
         # all reference the old session consistently.
-        if self._session_turns:
-            old_turns = list(self._session_turns)
+        if self._session_turns and self._turn_counter % self._retain_every_n_turns:
+            old_document_id, old_update_mode = self._resolve_retain_target(
+                self._document_id
+            )
+            old_turns = (
+                self._session_turns[self._last_retained_turn_count:]
+                if old_update_mode == "append"
+                else list(self._session_turns)
+            )
             old_session_id = self._session_id
             old_parent_session_id = self._parent_session_id
             old_turn_index = self._turn_index
@@ -2340,10 +2383,6 @@ class HindsightMemoryProvider(MemoryProvider):
             # we rotate _session_id, so the flush lands in the old
             # session's document either way (legacy: per-process unique;
             # ≥0.5.0: stable session-scoped + append).
-            old_document_id, old_update_mode = self._resolve_retain_target(
-                self._document_id
-            )
-
             def _flush():
                 try:
                     item = self._build_retain_kwargs(
@@ -2377,7 +2416,7 @@ class HindsightMemoryProvider(MemoryProvider):
             # two threads on aretain_batch against the same document, and
             # keeps shutdown's drain semantics intact. Skip enqueue if
             # shutdown has already fired — the writer is draining/gone.
-            if not self._shutting_down.is_set():
+            if old_turns and not self._shutting_down.is_set():
                 self._ensure_writer()
                 self._register_atexit()
                 self._retain_queue.put(_flush)
@@ -2404,8 +2443,14 @@ class HindsightMemoryProvider(MemoryProvider):
             self._session_id, self._parent_session_id, reset, self._document_id,
         )
 
+    def on_session_end(self, messages=None) -> None:
+        """Flush a partial retain batch before the session lifecycle ends."""
+        if self._session_turns and self._session_id:
+            self.on_session_switch(self._session_id)
+
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
+        self.on_session_end()
         # Stop accepting new retain jobs first so anyone still calling
         # sync_turn() during teardown is dropped, not enqueued.
         self._shutting_down.set()

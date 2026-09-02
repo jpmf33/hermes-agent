@@ -90,6 +90,7 @@ def _make_mock_client():
         return_value=SimpleNamespace(text="Synthesized answer")
     )
     client.aretain_batch = AsyncMock()
+    client.acreate_bank = AsyncMock()
     client.aclose = AsyncMock()
     return client
 
@@ -233,6 +234,7 @@ class TestSchemas:
         assert "content" in RETAIN_SCHEMA["parameters"]["properties"]
         assert "tags" in RETAIN_SCHEMA["parameters"]["properties"]
         assert "content" in RETAIN_SCHEMA["parameters"]["required"]
+        assert "explicitly asks to remember" in RETAIN_SCHEMA["description"]
 
 
     def test_get_tool_schemas_returns_three(self, provider):
@@ -261,6 +263,7 @@ class TestConfig:
         assert provider._auto_recall is True
         assert provider._retain_every_n_turns == 1
         assert provider._recall_max_tokens == 4096
+        assert provider._recall_min_final_score == 0.0
         assert provider._recall_max_input_chars == 800
         assert provider._tags is None
         assert provider._observation_scopes is None
@@ -297,6 +300,7 @@ class TestConfig:
             retain_context="custom-ctx",
             bank_retain_mission="Extract key facts",
             recall_max_tokens=2048,
+            recall_min_final_score=0.005,
             recall_types=["world", "experience"],
             recall_prompt_preamble="Custom preamble:",
             recall_max_input_chars=500,
@@ -315,10 +319,24 @@ class TestConfig:
         assert p._retain_context == "custom-ctx"
         assert p._bank_retain_mission == "Extract key facts"
         assert p._recall_max_tokens == 2048
+        assert p._recall_min_final_score == 0.005
         assert p._recall_types == ["world", "experience"]
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
+
+    def test_bank_missions_sync_before_first_operation(self, provider_with_config):
+        p = provider_with_config(
+            bank_mission="Use durable operational context",
+            bank_retain_mission="Ignore transient progress",
+        )
+        p._do_recall("current project")
+
+        p._client.acreate_bank.assert_awaited_once_with(
+            bank_id="test-bank",
+            reflect_mission="Use durable operational context",
+            retain_mission="Ignore transient progress",
+        )
 
     def test_retain_source_defaults_empty(self, provider):
         # Opt-in per AGENTS.md: no attribution tag ships by default.
@@ -354,6 +372,7 @@ class TestConfig:
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
 
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"
@@ -507,6 +526,12 @@ class TestToolHandlers:
         ))
         assert "Memory 1" in result["result"]
         assert "Memory 2" in result["result"]
+
+    def test_recall_min_final_score_is_sent_to_server(self, provider_with_config):
+        p = provider_with_config(recall_min_final_score=0.005)
+        json.loads(p.handle_tool_call("hindsight_recall", {"query": "dark mode"}))
+
+        assert p._client.arecall.call_args.kwargs["min_scores"] == {"final": 0.005}
 
 
     def test_reflect_success(self, provider):
@@ -1096,6 +1121,19 @@ class TestShutdownRace:
         assert client.aretain_batch.call_count == 2
         assert provider._retain_queue.empty()
 
+    def test_shutdown_flushes_partial_retain_batch(self, provider_with_config):
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        client = p._client
+        p.sync_turn("a", "b")
+        p.sync_turn("c", "d")
+
+        p.shutdown()
+
+        client.aretain_batch.assert_awaited_once()
+        content = json.loads(client.aretain_batch.call_args.kwargs["items"][0]["content"])
+        assert "a" in json.dumps(content)
+        assert "c" in json.dumps(content)
+
 
 # ---------------------------------------------------------------------------
 # on_session_switch — flush + prefetch reset behavior
@@ -1292,6 +1330,30 @@ class TestUpdateModeAppendCapability:
         assert kw["document_id"] == "test-session"
         assert kw["items"][0]["update_mode"] == "append"
 
+    def test_session_switch_flushes_only_unretained_append_delta(
+        self, provider_with_config, monkeypatch
+    ):
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        for turn in range(1, 5):
+            p.sync_turn(f"user-{turn}", f"assistant-{turn}")
+        p._retain_queue.join()
+
+        p.on_session_switch("new-sid")
+        p._retain_queue.join()
+
+        assert p._client.aretain_batch.await_count == 2
+        flushed = json.loads(
+            p._client.aretain_batch.await_args_list[1].kwargs["items"][0]["content"]
+        )
+        flushed_text = json.dumps(flushed)
+        assert "user-4" in flushed_text
+        assert "user-1" not in flushed_text
+
 
 # ---------------------------------------------------------------------------
 # System prompt tests
@@ -1304,6 +1366,7 @@ class TestSystemPrompt:
         assert "Hindsight Memory" in block
         assert "hindsight_recall" in block
         assert "automatically injected" in block
+        assert "explicitly asks to remember" in block
 
 
 # ---------------------------------------------------------------------------
@@ -1325,6 +1388,7 @@ class TestConfigSchema:
             "auto_recall", "auto_retain",
             "retain_every_n_turns", "retain_async", "retain_context",
             "recall_max_tokens", "recall_max_input_chars",
+            "recall_min_final_score",
             "recall_prompt_preamble",
         }
         assert expected_keys.issubset(keys), f"Missing: {expected_keys - keys}"
