@@ -1,6 +1,8 @@
 """Tests for progressive subdirectory hint discovery."""
 
 import pytest
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -156,6 +158,40 @@ class TestPermissionErrorHandling:
             )
             # Result may be None (backend skipped) — the key point is no crash
             assert result is None or isinstance(result, str)
+
+    def test_hung_hint_read_fails_open_and_disables_future_scans(self, tmp_path):
+        """A TCC/filesystem stall must not wedge the conversation loop."""
+        sub = tmp_path / "restricted"
+        sub.mkdir()
+        hint = sub / "AGENTS.md"
+        hint.write_text("instructions")
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        release = threading.Event()
+        original_read_text = Path.read_text
+
+        def blocked_read_text(path, *args, **kwargs):
+            if path == hint:
+                release.wait(5)
+            return original_read_text(path, *args, **kwargs)
+
+        started = time.monotonic()
+        try:
+            with (
+                patch.object(Path, "read_text", blocked_read_text),
+                patch("agent.subdirectory_hints._HINT_DISCOVERY_TIMEOUT_SECONDS", 0.05),
+            ):
+                assert tracker.check_tool_call(
+                    "read_file", {"path": str(sub / "file.py")}
+                ) is None
+                assert time.monotonic() - started < 1
+
+                second_started = time.monotonic()
+                assert tracker.check_tool_call(
+                    "read_file", {"path": str(sub / "other.py")}
+                ) is None
+                assert time.monotonic() - second_started < 0.1
+        finally:
+            release.set()
 
 
 class TestOutsideWorkspaceRejection:

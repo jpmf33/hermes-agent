@@ -47,6 +47,11 @@ _COMMAND_TOOLS = {"terminal"}
 # Prevents scanning all the way to / for deeply nested paths.
 _MAX_ANCESTOR_WALK = 5
 
+# Hint discovery is best-effort post-processing. A protected or wedged
+# filesystem path must never hold the conversation loop after the actual tool
+# call has already completed.
+_HINT_DISCOVERY_TIMEOUT_SECONDS = 2.0
+
 # Directory names that never contain authoritative project context.
 # Backups, vendored deps, VCS internals, and caches routinely hold *copies* of
 # AGENTS.md; loading those duplicates real context and inflates the prompt.
@@ -85,6 +90,7 @@ class SubdirectoryHintTracker:
     def __init__(self, working_dir: Optional[str] = None):
         self.working_dir = Path(working_dir or os.getcwd()).resolve()
         self._loaded_dirs: Set[Path] = set()
+        self._disabled = False
         # Content digests already injected — prevents re-sending the same file
         # reachable through symlinks, hardlinks, or duplicated copies.
         self._loaded_digests: Set[str] = set()
@@ -123,6 +129,48 @@ class SubdirectoryHintTracker:
 
         Returns formatted hint text to append to the tool result, or None.
         """
+        if self._disabled:
+            return None
+
+        # Avoid a thread for tools that cannot reference a filesystem path.
+        has_direct_path = any(
+            isinstance(tool_args.get(key), str) and tool_args[key].strip()
+            for key in _PATH_ARG_KEYS
+        )
+        has_command = (
+            tool_name in _COMMAND_TOOLS
+            and isinstance(tool_args.get("command"), str)
+            and bool(tool_args["command"].strip())
+        )
+        if not has_direct_path and not has_command:
+            return None
+
+        from agent.deadline import run_bounded_sync
+
+        result = run_bounded_sync(
+            lambda: self._check_tool_call(tool_name, tool_args),
+            _HINT_DISCOVERY_TIMEOUT_SECONDS,
+            label="subdirectory hint discovery",
+        )
+        if result.timed_out:
+            # One bad mount/TCC prompt is enough evidence to fail open for the
+            # rest of this agent instance. This also caps leaked daemon workers
+            # at one instead of one per later tool call.
+            self._disabled = True
+            logger.warning(
+                "Subdirectory hint discovery timed out after %.1fs; "
+                "disabling it for this agent instance",
+                _HINT_DISCOVERY_TIMEOUT_SECONDS,
+            )
+            return None
+        return result.value
+
+    def _check_tool_call(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+    ) -> Optional[str]:
+        """Unbounded implementation; ``check_tool_call`` owns the deadline."""
         dirs = self._extract_directories(tool_name, tool_args)
         if not dirs:
             return None

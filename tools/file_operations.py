@@ -64,6 +64,38 @@ _MACOS_TCC_PROTECTED_HOME_DIRS = (
     "Pictures",
 )
 
+_MACOS_TCC_PROTECTED_READ_TIMEOUT_SECONDS = 5
+
+
+def _is_macos_tcc_protected_path(
+    path: str,
+    *,
+    cwd: Optional[str] = None,
+    home: Optional[str] = None,
+    platform: Optional[str] = None,
+) -> bool:
+    """Whether *path* is inside a macOS home-directory TCC category.
+
+    This is deliberately lexical: resolving or probing the path is the very
+    operation that can block while macOS waits on an unattended privacy prompt.
+    """
+    if (platform or sys.platform) != "darwin":
+        return False
+
+    home_path = Path(os.path.normpath(str(Path(home or Path.home()).expanduser())))
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(cwd or os.getcwd()) / candidate
+    candidate = Path(os.path.normpath(str(candidate)))
+
+    for dirname in _MACOS_TCC_PROTECTED_HOME_DIRS:
+        try:
+            candidate.relative_to(home_path / dirname)
+            return True
+        except ValueError:
+            continue
+    return False
+
 
 def _macos_protected_search_exclusions(
     path: str,
@@ -1388,6 +1420,27 @@ class ShellFileOperations(FileOperations):
             f"else exit 1; fi"
         )
 
+    def _size_probe(self, path: str) -> ExecuteResult:
+        """Run the content-opening size probe with a macOS TCC safety bound."""
+        env = getattr(self, "env", None)
+        is_local = env is None or getattr(env, "is_local", True)
+        cwd = getattr(env, "cwd", None) or self.cwd
+        timeout = None
+        if is_local and _is_macos_tcc_protected_path(path, cwd=cwd, home=_HOME):
+            timeout = _MACOS_TCC_PROTECTED_READ_TIMEOUT_SECONDS
+        return self._exec(self._size_probe_cmd(path), timeout=timeout)
+
+    @staticmethod
+    def _size_probe_timeout_error(path: str) -> ReadResult:
+        return ReadResult(
+            error=(
+                f"Timed out opening '{path}'. On macOS this usually means "
+                "Hermes is waiting for privacy access to a protected folder. "
+                "Grant Full Disk Access to Hermes' Python executable, then "
+                "restart the gateway."
+            )
+        )
+
     @staticmethod
     def _not_regular_error(path: str) -> ReadResult:
         """Error for a path that exists but would block if read."""
@@ -1522,7 +1575,10 @@ class ShellFileOperations(FileOperations):
         offset, limit = normalize_read_pagination(offset, limit)
         
         # Check if file exists and get size (POSIX, works on Linux + macOS)
-        stat_result = self._exec(self._size_probe_cmd(path))
+        stat_result = self._size_probe(path)
+
+        if stat_result.exit_code == 124:
+            return self._size_probe_timeout_error(path)
 
         if stat_result.exit_code != 0:
             # File not found. Before failing, try unicode-equivalent
@@ -1807,7 +1863,9 @@ class ShellFileOperations(FileOperations):
         Uses cat so the full file is returned regardless of size.
         """
         path = self._expand_path(path)
-        stat_result = self._exec(self._size_probe_cmd(path))
+        stat_result = self._size_probe(path)
+        if stat_result.exit_code == 124:
+            return self._size_probe_timeout_error(path)
         if stat_result.exit_code != 0:
             return self._suggest_similar_files(path)
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
@@ -1849,7 +1907,9 @@ class ShellFileOperations(FileOperations):
     def read_file_bytes(self, path: str, max_bytes: Optional[int] = None) -> ReadResult:
         """Read binary-safe bytes from any shell-backed environment."""
         path = self._expand_path(path)
-        stat_result = self._exec(self._size_probe_cmd(path))
+        stat_result = self._size_probe(path)
+        if stat_result.exit_code == 124:
+            return self._size_probe_timeout_error(path)
         if stat_result.exit_code != 0:
             return ReadResult(error=f"File not found: {path}")
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
