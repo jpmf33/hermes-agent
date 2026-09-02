@@ -315,6 +315,42 @@ def gmail_get(args):
 
 
 
+def gmail_draft(args):
+    message = MIMEText(args.body, "html" if args.html else "plain")
+    message["To"] = args.to
+    message["Subject"] = args.subject
+    if args.cc:
+        message["Cc"] = args.cc
+    if args.from_header:
+        message["From"] = args.from_header
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    draft_body = {"message": {"raw": raw}}
+    if args.thread_id:
+        draft_body["message"]["threadId"] = args.thread_id
+
+    if _gws_binary():
+        result = _run_gws(
+            ["gmail", "users", "drafts", "create"],
+            params={"userId": "me"},
+            body=draft_body,
+        )
+    else:
+        service = build_service("gmail", "v1")
+        result = service.users().drafts().create(
+            userId="me", body=draft_body
+        ).execute()
+
+    draft_message = result.get("message", {})
+    print(json.dumps({
+        "status": "drafted",
+        "draftId": result["id"],
+        "messageId": draft_message.get("id", ""),
+        "threadId": draft_message.get("threadId", ""),
+    }, indent=2))
+
+
+
 def gmail_send(args):
     if _gws_binary():
         message = MIMEText(args.body, "html" if args.html else "plain")
@@ -1067,6 +1103,16 @@ def main():
     p = gmail_sub.add_parser("get")
     p.add_argument("message_id")
     p.set_defaults(func=gmail_get)
+
+    p = gmail_sub.add_parser("draft")
+    p.add_argument("--to", required=True)
+    p.add_argument("--subject", required=True)
+    p.add_argument("--body", required=True)
+    p.add_argument("--cc", default="")
+    p.add_argument("--from", dest="from_header", default="", help="Custom From header")
+    p.add_argument("--html", action="store_true", help="Create HTML draft")
+    p.add_argument("--thread-id", default="", help="Thread ID for threading")
+    p.set_defaults(func=gmail_draft)
 
     p = gmail_sub.add_parser("send")
     p.add_argument("--to", required=True)

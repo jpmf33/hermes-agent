@@ -136,6 +136,40 @@ def test_api_calendar_list_uses_events_list(api_module):
     assert params["calendarId"] == "primary"
 
 
+def test_api_gmail_draft_uses_drafts_create(api_module, capsys):
+    captured = {}
+
+    def capture_gws(cmd, *, params=None, body=None):
+        captured.update(cmd=cmd, params=params, body=body)
+        return {
+            "id": "draft-1",
+            "message": {"id": "message-1", "threadId": "thread-1"},
+        }
+
+    args = api_module.argparse.Namespace(
+        to="serraville.ai@gmail.com",
+        subject="Teste",
+        body="Corpo",
+        cc="",
+        from_header="",
+        html=False,
+        thread_id="",
+    )
+
+    with patch.object(api_module, "_run_gws", side_effect=capture_gws):
+        api_module.gmail_draft(args)
+
+    assert captured["cmd"] == ["gmail", "users", "drafts", "create"]
+    assert captured["params"] == {"userId": "me"}
+    assert "raw" in captured["body"]["message"]
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "drafted",
+        "draftId": "draft-1",
+        "messageId": "message-1",
+        "threadId": "thread-1",
+    }
+
+
 
 
 
