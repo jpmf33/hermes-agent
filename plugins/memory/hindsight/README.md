@@ -107,6 +107,7 @@ Config file: `~/.hermes/hindsight/config.json`
 | Key | Default | Description |
 |-----|---------|-------------|
 | `memory_mode` | `hybrid` | How memories are integrated into the agent |
+| `observation_scopes` | `` (Hindsight `combined`) | Observation scoping at consolidation: `combined`, `per_tag`, `all_combinations`, `shared` (one untagged scope, so consolidation dedups across per-session tags; Hindsight >= 0.9.2), or a JSON list of tag-lists |
 
 **memory_mode:**
 - `hybrid` — automatic context injection + tools available to the LLM
